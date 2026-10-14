@@ -1,0 +1,37 @@
+# Build products and local validation data
+/target/
+/dist/
+/test-artifacts/
+/local/
+/data/
+/models/
+/meetings/
+/recordings/
+# Meeting archives and media
+*.sqlite*
+*.db
+*.db-*
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.mp4
+*.mov
+# Credentials and signing material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.der
+*.keychain*
+signing.json
+# Local logs and caches
+*.log
+__pycache__/
+*.py[cod]
+.DS_Store
