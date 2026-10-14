@@ -1,9 +1,12 @@
 mod app;
 mod audio;
+mod call_detection;
 mod cli;
+mod clipboard;
 mod mcp;
 mod model;
 mod store;
+mod titles;
 mod transcribe;
 
 fn main() {

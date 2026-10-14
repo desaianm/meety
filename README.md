@@ -10,15 +10,20 @@ The desktop app and CLI currently retain their original names, **Meetlocal** and
 - Manual recording of microphone and system audio through Core Audio.
 - Offline English transcription with quantized Moonshine Medium Streaming or Small Streaming.
 - Automatically saved notes, timestamped transcripts, search, and Markdown export.
+- Automatic local titles after transcription, while preserving titles you edit.
+- One-click copying of the full transcript with timestamps and speaker labels.
+- Optional detection of microphone activity from other apps, with a prompt to start recording.
 - Permanent meeting deletion with confirmation; active recordings and transcriptions are protected.
 - CLI access and a read-only stdio MCP server for coding agents.
 - Local SQLite and WAV storage, with no account, subscription, age restriction, telemetry, or automatic cloud sync.
 
 Transcription runs after you stop recording. Labels distinguish **You** and **Meeting audio**, rather than individual remote speakers. Summaries are available through a connected agent when you ask for them; the app does not generate summaries itself.
 
+Call detection indicates a possible call, not a guaranteed meeting: dictation and other microphone use can also trigger it. Detection reads audio-process activity without capturing audio. Recording always requires an explicit Start action. Disable hints with **Detect possible calls** in the sidebar or menu bar; see [call detection details](docs/CALL-DETECTION.md).
+
 ## Build and install
 
-Requires an Apple silicon Mac running macOS 14.2 or later, Rust 1.91 or later, and Xcode Command Line Tools. Python 3 is used for packaging and Swift for one-time signing setup. The installed app has no Python or Node runtime dependency.
+Requires an Apple silicon Mac running macOS 14.2 or later, Rust 1.91 or later, and Xcode Command Line Tools. Python 3 is used for packaging, and Swift for signing setup and the optional on-device title helper. The installed app has no Python or Node runtime dependency.
 
 ```sh
 git clone https://github.com/desaianm/meety.git
@@ -53,6 +58,10 @@ macOS asks for microphone and system-audio access on first use. Changing signing
 4. Click **Stop & transcribe**. The transcript appears beside your notes when local processing finishes.
 
 Closing the window leaves the menu bar app running. Choose **Open Meetlocal** from its menu to reopen the library. Use **Open Markdown** to view an exported copy. **Delete meeting** permanently removes its notes, transcript, search entries and saved audio after confirmation; copies exported elsewhere remain.
+
+**Copy transcript** copies all transcript segments, timestamps and speaker labels as plain text. It excludes your separate notes and leaves the clipboard unchanged when no transcript is available.
+
+New untitled meetings receive a topic title after transcription. On supported Macs with Apple Intelligence enabled, titles use Apple's on-device Foundation Models framework. Older or unavailable systems use a short extractive title from the transcript. Neither path uploads meeting text. Titles you edit yourself, including names passed explicitly through the CLI, are preserved.
 
 Use headphones to reduce microphone echo. Keep the laptop lid open when using the built-in microphone, or select an external input in System Settings → Sound → Input. Apple silicon laptops disconnect their built-in microphone in hardware when the lid is closed. See [Apple's documentation](https://support.apple.com/en-ca/guide/security/secbbd20b00b/web).
 

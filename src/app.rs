@@ -1,4 +1,4 @@
-use crate::{audio::Capture, model, store::Paths, transcribe};
+use crate::{audio::Capture, call_detection, model, store::Paths, transcribe};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
@@ -22,7 +22,7 @@ use tao::{
 use tray_icon::{
     menu::{
         accelerator::{Accelerator, Code, Modifiers},
-        Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+        CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
     },
     Icon, TrayIconBuilder,
 };
@@ -36,10 +36,11 @@ struct State {
     transcribing: bool,
     metrics: Value,
     error: Option<String>,
+    call_detection: call_detection::Status,
 }
 impl State {
     fn json(&self) -> Value {
-        json!({"app_running":true,"menu_bar_ready":self.menu_bar_ready,"preparing":self.preparing,"microphone_permission":hypr_capture::microphone_permission(),"recording":self.active.is_some(),"meeting_id":self.active,"elapsed_seconds":self.elapsed,"transcribing":self.transcribing,"audio":self.metrics,"error":self.error})
+        json!({"app_running":true,"menu_bar_ready":self.menu_bar_ready,"preparing":self.preparing,"microphone_permission":hypr_capture::microphone_permission(),"recording":self.active.is_some(),"meeting_id":self.active,"elapsed_seconds":self.elapsed,"transcribing":self.transcribing,"audio":self.metrics,"error":self.error,"call_detection":{ "enabled":self.call_detection.enabled,"possible_call":self.call_detection.possible_call&&!self.preparing&&self.active.is_none()&&!self.transcribing,"unavailable":self.call_detection.unavailable}})
     }
 }
 struct Request {
@@ -121,11 +122,36 @@ pub fn run(p: Paths) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    let state = Arc::new(Mutex::new(State::default()));
+    let detection = Arc::new(Mutex::new(call_detection::Monitor::new(&p.root)?));
+    let state = Arc::new(Mutex::new(State {
+        call_detection: detection.lock().unwrap().status(),
+        ..State::default()
+    }));
+    let sensor_state = state.clone();
+    let sensor_monitor = detection.clone();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            // Query only metadata, never open a microphone or process tap.
+            let enabled = sensor_monitor.lock().unwrap().status().enabled;
+            if enabled {
+                let activity = hypr_capture::other_microphone_users().map_err(|_| ());
+                let busy = {
+                    let s = sensor_state.lock().unwrap();
+                    s.preparing || s.active.is_some() || s.transcribing
+                };
+                let mut monitor = sensor_monitor.lock().unwrap();
+                let status = monitor.observe(started.elapsed(), activity, busy);
+                sensor_state.lock().unwrap().call_detection = status;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
     let (tx, rx) = mpsc::channel::<Request>();
     let worker_paths = p.clone();
     let worker_state = state.clone();
-    std::thread::spawn(move || worker(worker_paths, worker_state, rx));
+    let worker_detection = detection.clone();
+    std::thread::spawn(move || worker(worker_paths, worker_state, rx, worker_detection));
     let server_tx = tx.clone();
     let server_state = state.clone();
     std::thread::spawn(move || {
@@ -176,6 +202,14 @@ pub fn run(p: Paths) -> Result<()> {
     let open_app = MenuItem::new("Open Meetlocal", true, None);
     let status = MenuItem::new("Meetlocal · Ready", false, None);
     let toggle = MenuItem::new("Start Recording", true, None);
+    let call_hint = MenuItem::new("Call detection · Watching microphone", false, None);
+    let call_ignore = MenuItem::new("Ignore this call", false, None);
+    let call_detection_toggle = CheckMenuItem::new(
+        "Detect possible calls",
+        true,
+        detection.lock().unwrap().status().enabled,
+        None,
+    );
     let latest = MenuItem::new("Open Latest Transcript", true, None);
     let archive = MenuItem::new("Open Local Archive", true, None);
     let permissions = MenuItem::new("Audio Permissions…", true, None);
@@ -208,6 +242,9 @@ pub fn run(p: Paths) -> Result<()> {
         &status,
         &PredefinedMenuItem::separator(),
         &toggle,
+        &call_hint,
+        &call_ignore,
+        &call_detection_toggle,
         &latest,
         &archive,
         &PredefinedMenuItem::separator(),
@@ -237,6 +274,16 @@ pub fn run(p: Paths) -> Result<()> {
             Event::UserEvent(UiEvent::Menu(event))=>{
                 let snapshot=state.lock().unwrap().clone();
                 if event.id==open_app.id(){target.set_activation_policy_at_runtime(ActivationPolicy::Regular);window.set_visible(true);window.set_focus();}
+                else if event.id==call_hint.id(){
+                    if snapshot.call_detection.possible_call&&!snapshot.preparing&&snapshot.active.is_none()&&!snapshot.transcribing&&!downloading {
+                        let _=update_detection(&state,&detection,|d|Ok(d.dismiss()));
+                        let (reply,_)=mpsc::channel();let _=tx.send(Request{value:json!({"op":"start"}),reply});
+                    }
+                }else if event.id==call_ignore.id(){let _=update_detection(&state,&detection,|d|Ok(d.dismiss()));}
+                else if event.id==call_detection_toggle.id(){
+                    let result=update_detection(&state,&detection,|d|d.set_enabled(call_detection_toggle.is_checked()));
+                    if let Err(e)=result {state.lock().unwrap().error=Some(e.to_string());}
+                }
                 else if event.id==toggle.id(){
                     if !snapshot.preparing && !snapshot.transcribing && !downloading {
                         let value=if snapshot.active.is_some(){json!({"op":"stop"})}else{json!({"op":"start"})};
@@ -271,8 +318,8 @@ pub fn run(p: Paths) -> Result<()> {
                 }
             },
             Event::UserEvent(UiEvent::Message(message))=>{
-                let p=p.clone();let state=state.clone();let tx=tx.clone();let proxy=ui_proxy.clone();
-                std::thread::spawn(move||{let rid=message["rid"].clone();let result=ui_request(&p,&state,&tx,&message);let response=match result{Ok(value)=>json!({"rid":rid,"result":value}),Err(e)=>json!({"rid":rid,"error":format!("{e:#}")})};let _=proxy.send_event(UiEvent::Response(response));});
+                let p=p.clone();let state=state.clone();let tx=tx.clone();let proxy=ui_proxy.clone();let detection=detection.clone();
+                std::thread::spawn(move||{let rid=message["rid"].clone();let result=ui_request(&p,&state,&tx,&detection,&message);let response=match result{Ok(value)=>json!({"rid":rid,"result":value}),Err(e)=>json!({"rid":rid,"error":format!("{e:#}")})};let _=proxy.send_event(UiEvent::Response(response));});
             },
             Event::UserEvent(UiEvent::Response(response))=>{let _=webview.evaluate_script(&format!("window.meetlocalResponse({response})"));},
             Event::WindowEvent{event:WindowEvent::CloseRequested,..}=>{window.set_visible(false);target.set_activation_policy_at_runtime(ActivationPolicy::Accessory);},
@@ -282,20 +329,35 @@ pub fn run(p: Paths) -> Result<()> {
         last_ui_update=Instant::now();
         if let Ok(result)=download_results.try_recv(){downloading=false;state.lock().unwrap().error=result.err();}
         let snapshot=state.lock().unwrap().clone();let choice=model::selected(&p);
-        let text=if downloading{"Downloading English model…".into()}else if snapshot.preparing{"Starting audio… Check macOS permissions".into()}else if snapshot.active.is_some(){format!("Recording · {:02}:{:02}",snapshot.elapsed/60,snapshot.elapsed%60)}else if snapshot.transcribing{"Transcribing locally…".into()}else if let Some(error)=&snapshot.error{format!("Error · {}",error.chars().take(100).collect::<String>())}else{format!("Ready · English · {}",choice.name())};
+        let possible_call=snapshot.call_detection.possible_call&&!snapshot.preparing&&snapshot.active.is_none()&&!snapshot.transcribing&&!downloading;
+        call_hint.set_text(if possible_call{"Possible call detected · Start recording"}else if !snapshot.call_detection.enabled{"Call detection · Off"}else if snapshot.call_detection.unavailable{"Call detection · Unavailable"}else{"Call detection · Watching microphone"});
+        call_hint.set_enabled(possible_call);call_ignore.set_enabled(possible_call);call_detection_toggle.set_checked(snapshot.call_detection.enabled);
+        let text=if downloading{"Downloading English model…".into()}else if snapshot.preparing{"Starting audio… Check macOS permissions".into()}else if snapshot.active.is_some(){format!("Recording · {:02}:{:02}",snapshot.elapsed/60,snapshot.elapsed%60)}else if snapshot.transcribing{"Transcribing locally…".into()}else if let Some(error)=&snapshot.error{format!("Error · {}",error.chars().take(100).collect::<String>())}else if possible_call{"Possible call detected · Choose Start recording or Ignore".into()}else{format!("Ready · English · {}",choice.name())};
         status.set_text(&text);toggle.set_text(if snapshot.active.is_some(){"Stop & Transcribe"}else{"Start Recording"});toggle.set_enabled(!snapshot.preparing&&!snapshot.transcribing&&!downloading);
         download.set_enabled(!downloading&&!snapshot.transcribing&&snapshot.active.is_none());
         if let Some(tray)=&tray{
             let _=tray.set_tooltip(Some(&text));
             if snapshot.active.is_some(){let _=tray.set_icon(Some(icon(true)));}else{let _=tray.set_icon_templated(Some(icon(false)));}
-            tray.set_title(if snapshot.active.is_some(){Some(format!("{:02}:{:02}",snapshot.elapsed/60,snapshot.elapsed%60))}else{None});
+            tray.set_title(if snapshot.active.is_some(){Some(format!("{:02}:{:02}",snapshot.elapsed/60,snapshot.elapsed%60))}else if possible_call{Some("Call?".to_string())}else{None});
         }
     });
+}
+// Mutations always take the detector lock before the shared UI state. Holding
+// it until publication prevents an in-flight poll from restoring stale settings.
+fn update_detection(
+    state: &Arc<Mutex<State>>,
+    detection: &Arc<Mutex<call_detection::Monitor>>,
+    change: impl FnOnce(&mut call_detection::Monitor) -> Result<call_detection::Status>,
+) -> Result<()> {
+    let mut monitor = detection.lock().unwrap();
+    state.lock().unwrap().call_detection = change(&mut monitor)?;
+    Ok(())
 }
 fn ui_request(
     p: &Paths,
     state: &Arc<Mutex<State>>,
     tx: &mpsc::Sender<Request>,
+    detection: &Arc<Mutex<call_detection::Monitor>>,
     message: &Value,
 ) -> Result<Value> {
     match message["op"].as_str().unwrap_or("") {
@@ -303,16 +365,35 @@ fn ui_request(
         "get" => Ok(serde_json::to_value(
             p.get(message["id"].as_str().context("Missing meeting id")?)?,
         )?),
-        "new" => Ok(json!(p.create("Untitled meeting", "draft")?)),
+        "new" => Ok(json!(p.create_untitled("Untitled meeting", "draft")?)),
         "save" => {
-            p.save_notes(
-                message["id"].as_str().context("Missing id")?,
-                message["title"].as_str().context("Missing title")?,
-                message["notes"].as_str().context("Missing notes")?,
-            )?;
-            Ok(json!({"saved":true}))
+            let id = message["id"].as_str().context("Missing id")?;
+            let title = message["title"].as_str().context("Missing title")?;
+            let notes = message["notes"].as_str().context("Missing notes")?;
+            if message["title_edited"].as_bool().unwrap_or(true) {
+                p.save_notes(id, title, notes)?;
+            } else {
+                p.save_notes_with_title_edit(id, title, notes, false)?;
+            }
+            Ok(json!({"saved":true,"meeting":p.get(id)?.meeting}))
+        }
+        "call_detection" => {
+            let enabled = message["enabled"]
+                .as_bool()
+                .context("Missing detection preference")?;
+            update_detection(state, detection, |d| d.set_enabled(enabled))?;
+            Ok(state.lock().unwrap().json())
+        }
+        "call_dismiss" => {
+            update_detection(state, detection, |d| Ok(d.dismiss()))?;
+            Ok(state.lock().unwrap().json())
         }
         "status" => Ok(state.lock().unwrap().json()),
+        "copy_transcript" => {
+            let transcript = p.get(message["id"].as_str().context("Missing meeting id")?)?;
+            crate::clipboard::copy_transcript(&transcript.segments)?;
+            Ok(json!({"copied":true}))
+        }
         "search" => Ok(serde_json::to_value(
             p.search(message["query"].as_str().unwrap_or(""), 100)?,
         )?),
@@ -354,7 +435,12 @@ fn ui_request(
         _ => bail!("Unknown app action"),
     }
 }
-fn worker(p: Paths, state: Arc<Mutex<State>>, rx: mpsc::Receiver<Request>) {
+fn worker(
+    p: Paths,
+    state: Arc<Mutex<State>>,
+    rx: mpsc::Receiver<Request>,
+    detection: Arc<Mutex<call_detection::Monitor>>,
+) {
     let mut capture: Option<(String, Capture)> = None;
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
@@ -372,6 +458,9 @@ fn worker(p: Paths, state: Arc<Mutex<State>>, rx: mpsc::Receiver<Request>) {
                             if !model::ready(&p, choice) {
                                 bail!("Download English model before recording");
                             }
+                            // A user starting from the toolbar, CLI or menu has
+                            // handled this suggestion, not only banner starts.
+                            update_detection(&state, &detection, |d| Ok(d.dismiss()))?;
                             let title = request.value["title"]
                                 .as_str()
                                 .map(String::from)
@@ -388,8 +477,10 @@ fn worker(p: Paths, state: Arc<Mutex<State>>, rx: mpsc::Receiver<Request>) {
                                 }
                                 p.set_status(&t.meeting.id, "recording", None)?;
                                 t.meeting.id
-                            } else {
+                            } else if request.value["title"].is_string() {
                                 p.create(&title, "recording")?
+                            } else {
+                                p.create_untitled(&title, "recording")?
                             };
                             state.lock().unwrap().preparing = true;
                             let started = Capture::start(&p.meeting_dir(&id));

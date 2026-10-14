@@ -55,29 +55,48 @@ impl Paths {
                 start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, source TEXT NOT NULL, text TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS segments_meeting ON segments(meeting_id,start_ms);
             CREATE VIRTUAL TABLE IF NOT EXISTS transcript_search USING fts5(meeting_id UNINDEXED, text);")?;
-        let has_notes = conn
+        let columns = conn
             .prepare("PRAGMA table_info(meetings)")?
             .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .iter()
-            .any(|name| name == "notes");
-        if !has_notes {
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !columns.iter().any(|name| name == "notes") {
             conn.execute(
                 "ALTER TABLE meetings ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        // Existing meetings always retain their titles, even old placeholders.
+        // Ownership is explicit for every meeting created after this migration.
+        if !columns.iter().any(|name| name == "title_origin") {
+            conn.execute(
+                "ALTER TABLE meetings ADD COLUMN title_origin TEXT NOT NULL DEFAULT 'user'",
+                [],
+            )?;
+        }
+        if !columns.iter().any(|name| name == "title_revision") {
+            conn.execute(
+                "ALTER TABLE meetings ADD COLUMN title_revision INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
         Ok(conn)
     }
     pub fn create(&self, title: &str, status: &str) -> Result<String> {
+        self.create_with_origin(title, status, "user")
+    }
+    /// Explicitly opt a newly created placeholder into automatic titling.
+    pub fn create_untitled(&self, title: &str, status: &str) -> Result<String> {
+        self.create_with_origin(title, status, "automatic")
+    }
+    fn create_with_origin(&self, title: &str, status: &str, origin: &str) -> Result<String> {
         if title.trim().is_empty() || title.len() > 500 {
             bail!("Title must contain 1–500 bytes");
         }
         let id = uuid::Uuid::new_v4().to_string();
         fs::create_dir(self.meeting_dir(&id))?;
         self.db()?.execute(
-            "INSERT INTO meetings(id,title,created_at,status) VALUES(?1,?2,?3,?4)",
-            params![id, title.trim(), Utc::now().to_rfc3339(), status],
+            "INSERT INTO meetings(id,title,created_at,status,title_origin) VALUES(?1,?2,?3,?4,?5)",
+            params![id, title.trim(), Utc::now().to_rfc3339(), status, origin],
         )?;
         Ok(id)
     }
@@ -90,7 +109,7 @@ impl Paths {
     }
     pub fn list(&self, limit: usize) -> Result<Vec<Meeting>> {
         let conn = self.db()?;
-        let mut stmt = conn.prepare("SELECT id,title,created_at,status,error,duration_seconds FROM meetings ORDER BY created_at DESC LIMIT ?1")?;
+        let mut stmt = conn.prepare("SELECT id,title,created_at,status,error,duration_seconds,title_origin,title_revision FROM meetings ORDER BY created_at DESC LIMIT ?1")?;
         let rows = stmt.query_map([limit.clamp(1, 500)], meeting_from_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -109,7 +128,7 @@ impl Paths {
     pub fn get(&self, id: &str) -> Result<Transcript> {
         let id = self.resolve(id)?;
         let conn = self.db()?;
-        let meeting = conn.query_row("SELECT id,title,created_at,status,error,duration_seconds FROM meetings WHERE id=?1", [&id], meeting_from_row).context("Meeting not found")?;
+        let meeting = conn.query_row("SELECT id,title,created_at,status,error,duration_seconds,title_origin,title_revision FROM meetings WHERE id=?1", [&id], meeting_from_row).context("Meeting not found")?;
         let mut stmt = conn.prepare("SELECT start_ms,end_ms,source,text FROM segments WHERE meeting_id=?1 ORDER BY start_ms,id")?;
         let segments = stmt
             .query_map([&id], |row| {
@@ -131,6 +150,19 @@ impl Paths {
         })
     }
     pub fn save_notes(&self, id: &str, title: &str, notes: &str) -> Result<()> {
+        // Legacy callers supply a title intentionally; protect it conservatively.
+        self.save_notes_with_title_edit(id, title, notes, true)
+    }
+    /// `title_edited` records user intent, including renaming to the same text.
+    /// Notes-only saves never write the supplied title: it may be stale while
+    /// automatic generation finishes in another thread.
+    pub fn save_notes_with_title_edit(
+        &self,
+        id: &str,
+        title: &str,
+        notes: &str,
+        title_edited: bool,
+    ) -> Result<()> {
         let id = self.resolve(id)?;
         if title.trim().is_empty() || title.len() > 500 {
             bail!("Title must contain 1–500 bytes");
@@ -139,17 +171,42 @@ impl Paths {
             bail!("Notes are limited to 1 MB");
         }
         let changed = self.db()?.execute(
-            "UPDATE meetings SET title=?2,notes=?3 WHERE id=?1",
-            params![id, title.trim(), notes],
+            "UPDATE meetings SET
+                title_origin=CASE WHEN ?4 THEN 'user' ELSE title_origin END,
+                title_revision=title_revision+CASE WHEN ?4 THEN 1 ELSE 0 END,
+                title=CASE WHEN ?4 THEN ?2 ELSE title END,notes=?3 WHERE id=?1",
+            params![id, title.trim(), notes, title_edited],
         )?;
         if changed == 0 {
             bail!("Meeting not found");
         }
-        atomic_write(
-            &self.meeting_dir(&id).join("transcript.md"),
-            self.get(&id)?.markdown().as_bytes(),
-        )?;
+        self.write_markdown(&id)?;
         Ok(())
+    }
+    /// Apply an automatic title only if no title edit happened since generation began.
+    pub fn apply_automatic_title(
+        &self,
+        id: &str,
+        expected_revision: i64,
+        title: &str,
+        origin: &str,
+    ) -> Result<bool> {
+        let id = self.resolve(id)?;
+        if title.trim().is_empty()
+            || title.len() > 500
+            || !matches!(origin, "on_device_model" | "transcript_excerpt")
+        {
+            bail!("Invalid automatic title");
+        }
+        let changed = self.db()?.execute(
+            "UPDATE meetings SET title=?3,title_origin=?4,title_revision=title_revision+1
+             WHERE id=?1 AND title_origin='automatic' AND title_revision=?2",
+            params![id, expected_revision, title.trim(), origin],
+        )?;
+        if changed != 0 {
+            self.write_markdown(&id)?;
+        }
+        Ok(changed != 0)
     }
     pub fn save_transcript(&self, id: &str, segments: &[Segment], duration: f64) -> Result<()> {
         let mut conn = self.db()?;
@@ -168,10 +225,24 @@ impl Paths {
             params![id, duration],
         )?;
         tx.commit()?;
-        let transcript = self.get(id)?;
-        let path = self.meeting_dir(id).join("transcript.md");
-        atomic_write(&path, transcript.markdown().as_bytes())?;
+        self.write_markdown(id)?;
         Ok(())
+    }
+    fn write_markdown(&self, id: &str) -> Result<()> {
+        use fs2::FileExt;
+        // Serialize read+export across notes and title writers. Otherwise an
+        // older title snapshot could replace a newer user's Markdown export.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.meeting_dir(id).join("markdown.lock"))?;
+        lock.lock_exclusive()?;
+        atomic_write(
+            &self.meeting_dir(id).join("transcript.md"),
+            self.get(id)?.markdown().as_bytes(),
+        )
     }
     pub fn delete(&self, id: &str) -> Result<()> {
         use fs2::FileExt;
@@ -238,6 +309,8 @@ fn meeting_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Meeting> {
         status: row.get(3)?,
         error: row.get(4)?,
         duration_seconds: row.get(5)?,
+        title_origin: row.get(6)?,
+        title_revision: row.get(7)?,
     })
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -248,6 +321,9 @@ pub struct Meeting {
     pub status: String,
     pub error: Option<String>,
     pub duration_seconds: f64,
+    /// user, automatic (placeholder), on_device_model, or transcript_excerpt.
+    pub title_origin: String,
+    pub title_revision: i64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Segment {
@@ -302,6 +378,42 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_title_migration_protects_all_existing_titles() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Connection::open(temp.path().join("meetlocal.sqlite3"))?;
+        db.execute_batch("CREATE TABLE meetings(id TEXT PRIMARY KEY,title TEXT NOT NULL,created_at TEXT NOT NULL,status TEXT NOT NULL,error TEXT,duration_seconds REAL NOT NULL DEFAULT 0);
+            INSERT INTO meetings(id,title,created_at,status) VALUES('legacy','Untitled meeting','2026-01-01','complete');")?;
+        drop(db);
+        let p = Paths::new(Some(temp.path().into()))?;
+        let meeting = p.list(1)?.remove(0);
+        assert_eq!(meeting.title, "Untitled meeting");
+        assert_eq!(meeting.title_origin, "user");
+        assert_eq!(meeting.title_revision, 0);
+        Ok(())
+    }
+    #[test]
+    fn automatic_title_persists_and_stale_notes_save_does_not_rename_it() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let p = Paths::new(Some(temp.path().into()))?;
+        let id = p.create_untitled("Untitled meeting", "complete")?;
+        p.save_notes_with_title_edit(&id, "Untitled meeting", "Draft notes", false)?;
+        assert!(p.apply_automatic_title(
+            &id,
+            0,
+            "Customer Onboarding Review",
+            "on_device_model"
+        )?);
+        p.save_notes_with_title_edit(&id, "Untitled meeting", "Later notes", false)?;
+        let reopened = Paths::new(Some(temp.path().into()))?;
+        let saved = reopened.get(&id)?;
+        assert_eq!(saved.meeting.title, "Customer Onboarding Review");
+        assert_eq!(saved.meeting.title_origin, "on_device_model");
+        assert_eq!(saved.notes, "Later notes");
+        assert!(saved.markdown().starts_with("# Customer Onboarding Review"));
+        assert!(!p.apply_automatic_title(&id, 0, "Outdated Title", "transcript_excerpt")?);
+        Ok(())
+    }
     #[test]
     fn deleting_meeting_removes_notes_search_transcript_and_audio() -> Result<()> {
         let t = tempfile::tempdir()?;
