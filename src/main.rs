@@ -1,5 +1,6 @@
 mod app;
 mod audio;
+mod call_detection;
 mod cli;
 mod clipboard;
 mod mcp;
