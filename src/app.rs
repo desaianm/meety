@@ -313,6 +313,11 @@ fn ui_request(
             Ok(json!({"saved":true}))
         }
         "status" => Ok(state.lock().unwrap().json()),
+        "copy_transcript" => {
+            let transcript = p.get(message["id"].as_str().context("Missing meeting id")?)?;
+            crate::clipboard::copy_transcript(&transcript.segments)?;
+            Ok(json!({"copied":true}))
+        }
         "search" => Ok(serde_json::to_value(
             p.search(message["query"].as_str().unwrap_or(""), 100)?,
         )?),

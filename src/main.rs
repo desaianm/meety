@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod cli;
+mod clipboard;
 mod mcp;
 mod model;
 mod store;
