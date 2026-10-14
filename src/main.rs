@@ -4,6 +4,7 @@ mod cli;
 mod mcp;
 mod model;
 mod store;
+mod titles;
 mod transcribe;
 
 fn main() {

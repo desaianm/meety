@@ -54,6 +54,11 @@ pub fn run(p: &Paths, id: &str) -> Result<()> {
         }
         segments.sort_by_key(|s| s.start_ms);
         p.save_transcript(&id, &segments, duration)?;
+        // Release the speech model before optional on-device title generation.
+        drop(engine);
+        // Titling must never turn a successfully saved transcript into a failure.
+        // Ownership/revision checks inside this operation protect concurrent edits.
+        let _ = crate::titles::after_transcription(p, &id, &segments);
         Ok(())
     })();
     if let Err(e) = &result {
