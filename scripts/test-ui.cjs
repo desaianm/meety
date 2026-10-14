@@ -75,6 +75,60 @@ run(`api=fakeApi;list=async()=>{};renderDetail=t=>{selected=t;dirty=false;};
   assert.equal(elements.get('detail').hidden, true);
   assert.equal(elements.get('delete-dialog').open, false);
 
+  // A notes-only autosave must accept the authoritative generated title.
+  run(`selected={meeting:{id:'titled',title:'Untitled meeting',title_revision:0},notes:''};titleEdited=false;
+    $('title').value='Untitled meeting';$('notes').value='Keep my agenda';$('notes').oninput();`);
+  const notesSave = run('save()');
+  assert.equal(calls[0].args.title_edited, false);
+  calls.shift().resolve({meeting:{id:'titled',title:'Product Launch Planning',title_revision:1}});
+  await notesSave;
+  assert.equal(elements.get('title').value, 'Product Launch Planning');
+  assert.equal(run('selected.notes'), 'Keep my agenda');
+
+  // Same-text title input still explicitly claims the title for the user.
+  run(`$('title').oninput();`);
+  const manualSave = run('save()');
+  assert.equal(calls[0].args.title_edited, true);
+  run(`$('title').value='My own meeting title';$('title').oninput();`);
+  calls.shift().resolve({meeting:{id:'titled',title:'Product Launch Planning',title_revision:2}});
+  await tick();
+  assert.equal(elements.get('title').value, 'My own meeting title', 'old save replies must preserve newer title input');
+  assert.equal(calls[0].args.title, 'My own meeting title');
+  assert.equal(calls[0].args.title_edited, true);
+  calls.shift().resolve({meeting:{id:'titled',title:'My own meeting title',title_revision:3}});
+  await manualSave;
+  assert.equal(run('dirty'), false);
+  assert.equal(run('titleEdited'), false);
+
+  // Polling can refresh a title without any transcript/status change.
+  run(`renderTranscript=()=>{};selected.segments=[];selected.meeting.status='complete';`);
+  const titlePoll = run('poll()');
+  calls.shift().resolve({});
+  await tick();
+  assert.equal(calls[0].op, 'get');
+  calls.shift().resolve({meeting:{id:'titled',status:'complete',title:'New Automatic Title',title_revision:4},segments:[]});
+  await titlePoll;
+  assert.equal(elements.get('title').value, 'New Automatic Title');
+  const typingPoll = run('poll()');
+  calls.shift().resolve({});
+  await tick();
+  run(`$('title').value='Typing during a poll';$('title').oninput();`);
+  calls.shift().resolve({meeting:{id:'titled',status:'complete',title:'Late Automatic Title',title_revision:5},segments:[]});
+  await typingPoll;
+  assert.equal(elements.get('title').value, 'Typing during a poll');
+  run('dirty=false;titleEdited=false;');
+  const savedDuringPoll = run('poll()');
+  calls.shift().resolve({});
+  await tick();
+  const olderGet = calls.shift();
+  run(`$('title').value='A saved custom title';$('title').oninput();`);
+  const savingDuringPoll = run('save()');
+  calls.shift().resolve({meeting:{id:'titled',status:'complete',title:'A saved custom title',title_revision:6}});
+  await savingDuringPoll;
+  olderGet.resolve({meeting:{id:'titled',status:'complete',title:'Old placeholder',title_revision:4},segments:[]});
+  await savedDuringPoll;
+  assert.equal(elements.get('title').value, 'A saved custom title', 'an older poll must not revert a completed title save');
+
   run(`selected={meeting:{id:'copy-fixture'},notes:'Never copied',segments:[]};updateCopyButton();`);
   assert.equal(elements.get('copy-transcript').disabled, true);
   await run('copyTranscript()');
@@ -106,5 +160,5 @@ run(`api=fakeApi;list=async()=>{};renderDetail=t=>{selected=t;dirty=false;};
   calls.shift().resolve({copied:true});
   await switchingCopy;
   assert.equal(elements.get('copy-transcript').textContent, 'Copy transcript', 'old replies must not report a different meeting copied');
-  console.log('Editor checks passed: autosave, navigation, retry, delete confirmation/cancel, active capture guard, empty library, transcript copy success/empty/error/navigation.');
+  console.log('Editor checks passed: autosave, navigation, retry, delete confirmation/cancel, active capture guard, empty library, transcript copy success/empty/error/navigation, title ownership and asynchronous title refresh.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -365,14 +365,17 @@ fn ui_request(
         "get" => Ok(serde_json::to_value(
             p.get(message["id"].as_str().context("Missing meeting id")?)?,
         )?),
-        "new" => Ok(json!(p.create("Untitled meeting", "draft")?)),
+        "new" => Ok(json!(p.create_untitled("Untitled meeting", "draft")?)),
         "save" => {
-            p.save_notes(
-                message["id"].as_str().context("Missing id")?,
-                message["title"].as_str().context("Missing title")?,
-                message["notes"].as_str().context("Missing notes")?,
-            )?;
-            Ok(json!({"saved":true}))
+            let id = message["id"].as_str().context("Missing id")?;
+            let title = message["title"].as_str().context("Missing title")?;
+            let notes = message["notes"].as_str().context("Missing notes")?;
+            if message["title_edited"].as_bool().unwrap_or(true) {
+                p.save_notes(id, title, notes)?;
+            } else {
+                p.save_notes_with_title_edit(id, title, notes, false)?;
+            }
+            Ok(json!({"saved":true,"meeting":p.get(id)?.meeting}))
         }
         "call_detection" => {
             let enabled = message["enabled"]
@@ -474,8 +477,10 @@ fn worker(
                                 }
                                 p.set_status(&t.meeting.id, "recording", None)?;
                                 t.meeting.id
-                            } else {
+                            } else if request.value["title"].is_string() {
                                 p.create(&title, "recording")?
+                            } else {
+                                p.create_untitled(&title, "recording")?
                             };
                             state.lock().unwrap().preparing = true;
                             let started = Capture::start(&p.meeting_dir(&id));
