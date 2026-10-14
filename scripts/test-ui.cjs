@@ -74,5 +74,37 @@ run(`api=fakeApi;list=async()=>{};renderDetail=t=>{selected=t;dirty=false;};
   assert.equal(elements.get('empty').hidden, false);
   assert.equal(elements.get('detail').hidden, true);
   assert.equal(elements.get('delete-dialog').open, false);
-  console.log('Editor checks passed: autosave, navigation, retry, delete confirmation/cancel, active capture guard, empty library.');
+
+  run(`selected={meeting:{id:'copy-fixture'},notes:'Never copied',segments:[]};updateCopyButton();`);
+  assert.equal(elements.get('copy-transcript').disabled, true);
+  await run('copyTranscript()');
+  assert.equal(calls.length, 0, 'empty transcripts must not replace the clipboard');
+  run(`selected.segments=[{start_ms:0,source:'You',text:'Synthetic transcript'}];updateCopyButton();`);
+  assert.equal(elements.get('copy-transcript').disabled, false);
+  const copying = run('copyTranscript()');
+  assert.equal(elements.get('copy-transcript').textContent, 'Copying…');
+  assert.equal(elements.get('copy-transcript').disabled, true);
+  assert.equal(calls[0].op, 'copy_transcript');
+  assert.equal(calls[0].args.id, 'copy-fixture');
+  assert.deepEqual(Object.keys(calls[0].args), ['id'], 'notes must not be included in the request');
+  await run('copyTranscript()');
+  assert.equal(calls.length, 1, 'repeated clicks must not duplicate the clipboard request');
+  calls.shift().resolve({copied:true});
+  await copying;
+  assert.equal(elements.get('copy-transcript').textContent, 'Copied!');
+  assert.equal(elements.get('copy-transcript').disabled, false);
+
+  const copyError = run('copyTranscript()');
+  calls.shift().reject(new Error('Clipboard unavailable'));
+  await copyError;
+  assert.equal(elements.get('error').textContent, 'Clipboard unavailable');
+  assert.equal(elements.get('copy-transcript').textContent, 'Copy transcript');
+  assert.equal(elements.get('copy-transcript').disabled, false, 'a failed copy must allow retry');
+
+  const switchingCopy = run('copyTranscript()');
+  run(`selected={meeting:{id:'other-copy-fixture'},segments:[{text:'Another transcript'}]};`);
+  calls.shift().resolve({copied:true});
+  await switchingCopy;
+  assert.equal(elements.get('copy-transcript').textContent, 'Copy transcript', 'old replies must not report a different meeting copied');
+  console.log('Editor checks passed: autosave, navigation, retry, delete confirmation/cancel, active capture guard, empty library, transcript copy success/empty/error/navigation.');
 })().catch(error => { console.error(error); process.exitCode = 1; });
