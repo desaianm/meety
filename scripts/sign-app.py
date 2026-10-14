@@ -7,13 +7,13 @@ import re
 import subprocess
 import sys
 
-app = sys.argv[1]
+app = Path(sys.argv[1])
 override = os.environ.get("MEETLOCAL_SIGN_IDENTITY")
-args = ["codesign", "--force", "--identifier", "local.meetlocal.app", "--timestamp=none"]
 if override:
     if override == "-":
         raise SystemExit("Ad hoc signing changes the permission identity. Choose a certificate instead.")
-    args += ["--sign", override]
+    signing = ["--sign", override]
+    fingerprint = None
 else:
     config = Path(os.environ.get("MEETLOCAL_SIGNING_CONFIG", str(Path.home() / "Library/Application Support/Meetlocal Build/signing.json")))
     if not config.exists():
@@ -22,7 +22,19 @@ else:
     fingerprint = identity["identity"]
     if not re.fullmatch(r"[0-9A-Fa-f]{40}", fingerprint):
         raise SystemExit("Invalid signing certificate fingerprint")
-    requirement = f'designated => identifier "local.meetlocal.app" and certificate leaf = H"{fingerprint}"'
-    args += ["--sign", fingerprint, "--keychain", identity["keychain"], "--requirements", "=" + requirement]
-subprocess.run(args + [app], check=True)
-subprocess.run(["codesign", "--verify", "--strict", app], check=True)
+    signing = ["--sign", fingerprint, "--keychain", identity["keychain"]]
+
+def sign(path, identifier):
+    args = ["codesign", "--force", "--identifier", identifier, "--timestamp=none"] + signing
+    if fingerprint:
+        requirement = f'designated => identifier "{identifier}" and certificate leaf = H"{fingerprint}"'
+        args += ["--requirements", "=" + requirement]
+    subprocess.run(args + [str(path)], check=True)
+    subprocess.run(["codesign", "--verify", "--strict", str(path)], check=True)
+
+# Seal nested executables before signing the containing app. Each helper keeps
+# its own identifier but reuses the same persistent local signing certificate.
+helper = app / "Contents/Resources/title-generator"
+if helper.is_file():
+    sign(helper, "local.meetlocal.app.title-generator")
+sign(app, "local.meetlocal.app")
