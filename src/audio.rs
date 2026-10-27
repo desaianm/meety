@@ -69,7 +69,7 @@ impl Track {
     }
     fn append(&mut self, samples: &[f32], rate: f64, position: f64) -> Result<()> {
         if !rate.is_finite() || !(8000.0..=192000.0).contains(&rate) {
-            bail!("Unsupported capture sample rate");
+            bail!("Unsupported capture sample rate: {rate}");
         }
         if self.rate.is_some_and(|r| (r - rate).abs() > 1.0) {
             self.resampler = Resampler::default();
@@ -149,6 +149,7 @@ impl Capture {
                     let mic=MicInput::new(None)?;
                     if *stopped.borrow(){bail!("Recording startup cancelled");}
                     let system=speaker.stream()?;
+                    system.check_format()?;
                     if *stopped.borrow(){bail!("Recording startup cancelled");}
                     // Aggregate-device startup can wait on a first-use system
                     // audio prompt. Start the microphone only after that wait,
@@ -159,24 +160,26 @@ impl Capture {
                     let mut microphone=microphone.ready_chunks(480);
                     let mut system=system.ready_chunks(480);
                     let started=Instant::now();
+                    let mut format_check=tokio::time::interval(std::time::Duration::from_millis(500));
                     let _=ready.send(Ok(started));
                     loop {
                         tokio::select! {
                             biased;
                             _=stopped.changed()=>break,
+                            _=format_check.tick()=>system.get_ref().check_format()?,
                             data=microphone.next()=>{
                                 let samples=data.context("Microphone stream ended")?;
                                 let mut t=shared.lock().unwrap();
                                 let position=if t.microphone.packets==0 { (started.elapsed().as_secs_f64()-samples.len() as f64/mic_rate as f64).max(0.0) }else{t.microphone.written as f64/RATE as f64};
-                                t.microphone.append(&samples,mic_rate as f64,position)?;
+                                t.microphone.append(&samples,mic_rate as f64,position).context("Microphone capture failed")?;
                                 if let Some(error)=mic_errors.lock().unwrap().clone(){bail!("{error}");}
                             },
                             data=system.next()=>{
                                 let samples=data.context("System audio stream ended; audio may have overflowed")?;
                                 let rate=system.get_ref().sample_rate();
                                 let mut t=shared.lock().unwrap();
-                                let position=if t.system.packets==0 { (started.elapsed().as_secs_f64()-samples.len() as f64/rate as f64).max(0.0) }else{t.system.written as f64/RATE as f64};
-                                t.system.append(&samples,rate as f64,position)?;
+                                let position=if t.system.packets==0 { (started.elapsed().as_secs_f64()-samples.len() as f64/rate).max(0.0) }else{t.system.written as f64/RATE as f64};
+                                t.system.append(&samples,rate,position).context("System audio capture failed")?;
                             },
                         }
                         if started.elapsed().as_secs()>=8*3600 {bail!("Eight-hour recording limit reached. Audio retained.");}

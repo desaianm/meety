@@ -15,6 +15,7 @@ const context = vm.createContext({
 });
 vm.runInContext(script.slice(0, script.lastIndexOf('(async()=>{await list();')), context);
 const run = code => vm.runInContext(code, context);
+const shippedRenderTranscript = run('renderTranscript');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const calls = [];
 context.fakeApi = (op, args) => new Promise((resolve, reject) => calls.push({ op, args, resolve, reject }));
@@ -160,5 +161,15 @@ run(`api=fakeApi;list=async()=>{};renderDetail=t=>{selected=t;dirty=false;};
   calls.shift().resolve({copied:true});
   await switchingCopy;
   assert.equal(elements.get('copy-transcript').textContent, 'Copy transcript', 'old replies must not report a different meeting copied');
+  // Completed partial recordings must display their durable capture warning.
+  context.document.createElement = tag => ({tag,textContent:'',children:[],append(...items){this.children.push(...items);}});
+  const transcriptBox = context.document.getElementById('transcript');
+  transcriptBox.replaceChildren = function(){this.children=[];};
+  transcriptBox.append = function(...items){this.children.push(...items);};
+  run(`selected={meeting:{id:'partial',status:'complete',error:'Partial recording: later speech may be missing.'},segments:[{start_ms:0,source:'You',text:'Retained speech'}]};`);
+  shippedRenderTranscript(run('selected'));
+  assert.equal(transcriptBox.children[0].textContent,'Partial recording: later speech may be missing.');
+  assert.equal(transcriptBox.children.length,2,'warning must not hide the recovered transcript');
+
   console.log('Editor checks passed: autosave, navigation, retry, delete confirmation/cancel, active capture guard, empty library, transcript copy success/empty/error/navigation, title ownership and asynchronous title refresh.');
 })().catch(error => { console.error(error); process.exitCode = 1; });
