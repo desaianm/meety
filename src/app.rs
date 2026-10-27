@@ -400,6 +400,18 @@ fn ui_request(
         "model_info" => {
             Ok(json!({"choice":model::selected(p),"ready":model::ready(p,model::selected(p))}))
         }
+        "vocabulary" => Ok(serde_json::to_value(crate::vocabulary::load(p)?)?),
+        "save_vocabulary" => Ok(serde_json::to_value(crate::vocabulary::update(
+            p,
+            message
+                .get("terms")
+                .map(|v| v.as_str().context("Invalid vocabulary terms"))
+                .transpose()?,
+            message
+                .get("use_meeting_context")
+                .map(|v| v.as_bool().context("Invalid context preference"))
+                .transpose()?,
+        )?)?),
         "model" => {
             let choice: model::Choice = serde_json::from_value(message["choice"].clone())?;
             if !model::ready(p, choice) {
