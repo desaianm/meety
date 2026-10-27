@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use moonshine_rs::{Transcriber, TranscriberOptions};
+use moonshine_rs::Transcriber;
 use std::{collections::BTreeMap, fs, path::Path};
 
 pub fn run(p: &Paths, id: &str) -> Result<()> {
@@ -21,6 +21,9 @@ pub fn run(p: &Paths, id: &str) -> Result<()> {
     if transcript.meeting.status == "recording" {
         bail!("Stop recording before transcribing");
     }
+    // Snapshot hints once, so both tracks use the same vocabulary and notes.
+    let hints = crate::vocabulary::load(p)?;
+    let context = crate::vocabulary::context(&hints, &transcript);
     let id = transcript.meeting.id;
     let choice = model::selected(p);
     if !model::ready(p, choice) {
@@ -28,7 +31,7 @@ pub fn run(p: &Paths, id: &str) -> Result<()> {
     }
     p.set_status(&id, "transcribing", None)?;
     let result = (|| -> Result<()> {
-        let options = TranscriberOptions::new().with_identify_speakers(false);
+        let options = crate::vocabulary::options(&hints, &context);
         let engine = Transcriber::from_files(model::path(p, choice), choice.arch(), Some(&options))
             .context("Load local English model")?;
         let directory = p.meeting_dir(&id);

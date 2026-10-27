@@ -30,6 +30,8 @@
 *.der
 *.keychain*
 signing.json
+vocabulary.json
+vocabulary.lock
 # Local logs and caches
 *.log
 __pycache__/

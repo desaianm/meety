@@ -8,6 +8,7 @@ mod model;
 mod store;
 mod titles;
 mod transcribe;
+mod vocabulary;
 
 fn main() {
     // Audio, transcripts, DB and socket are private to the current user.

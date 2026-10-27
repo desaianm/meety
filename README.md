@@ -9,6 +9,7 @@ The desktop app and CLI currently retain their original names, **Meetlocal** and
 - Native macOS menu bar controls and a meeting library.
 - Manual recording of microphone and system audio through Core Audio.
 - Offline English transcription with quantized Moonshine Medium Streaming or Small Streaming.
+- Private vocabulary and meeting-context hints for names, products and specialist terms.
 - Automatically saved notes, timestamped transcripts, search, and Markdown export.
 - Automatic local titles after transcription, while preserving titles you edit.
 - One-click copying of the full transcript with timestamps and speaker labels.
@@ -64,6 +65,40 @@ Closing the window leaves the menu bar app running. Choose **Open Meetlocal** fr
 New untitled meetings receive a topic title after transcription. On supported Macs with Apple Intelligence enabled, titles use Apple's on-device Foundation Models framework. Older or unavailable systems use a short extractive title from the transcript. Neither path uploads meeting text. Titles you edit yourself, including names passed explicitly through the CLI, are preserved.
 
 Use headphones to reduce microphone echo. Keep the laptop lid open when using the built-in microphone, or select an external input in System Settings → Sound → Input. Apple silicon laptops disconnect their built-in microphone in hardware when the lid is closed. See [Apple's documentation](https://support.apple.com/en-ca/guide/security/secbbd20b00b/web).
+
+## Vocabulary and meeting context
+
+Open **Vocabulary & context** in the library sidebar. Add a short list of names,
+products or specialist terms, one per line or separated by commas. The list is
+private to this Mac, editable, and starts empty. Duplicate terms are ignored;
+up to 64 terms of 100 characters each are accepted. Spelling and capitalization
+provide recognition hints, rather than forced replacements.
+
+**Use meeting notes and the title I enter as context** is enabled by default.
+Add an agenda or participant names to your notes and save them before stopping
+recording. The manual title and notes are sampled when transcription starts;
+changes made after that apply on the next retry. Automatic titles and old
+transcript text are excluded to avoid feeding recognition errors back into the
+model. Long context uses its beginning and end, capped at 8 KB, with at most 32
+context terms. Explicit vocabulary uses Moonshine's conservative 2.0 bias.
+
+Settings live in `vocabulary.json` in the private app-data directory. Neither
+hints nor notes are uploaded for transcription. No additional model is needed.
+Existing transcripts stay unchanged until you explicitly retry them. The same
+hints apply to imports and CLI retries, as well as recorded meetings.
+
+```sh
+meetlocal vocabulary show
+meetlocal vocabulary set --terms 'Example Product,SampleName'
+meetlocal vocabulary set --use-context false
+meetlocal vocabulary set --terms ''  # clear vocabulary; keep context preference
+```
+
+`--terms` replaces the list; omitted fields keep their current values. To repair
+an invalid settings file, supply both `--terms` and `--use-context`. These controls
+are available through the app and CLI; the agent MCP remains read-only. Vocabulary
+hints do not reliably resolve prices, negations or acoustically ambiguous words;
+check important details against the retained audio.
 
 ## CLI
 

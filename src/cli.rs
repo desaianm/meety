@@ -1,4 +1,4 @@
-use crate::{app, mcp, model, store::Paths, transcribe};
+use crate::{app, mcp, model, store::Paths, transcribe, vocabulary};
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -75,6 +75,11 @@ enum Command {
         #[command(subcommand)]
         action: ModelAction,
     },
+    /// Read or update private vocabulary and meeting-context hints.
+    Vocabulary {
+        #[command(subcommand)]
+        action: VocabularyAction,
+    },
     /// Read-only MCP server for Claude Code and Codex, over stdio.
     Mcp,
     /// Show app, model and data paths; never records audio.
@@ -96,6 +101,20 @@ enum ModelAction {
     Manifest {
         #[arg(value_enum, default_value = "medium")]
         model: model::Choice,
+    },
+}
+#[derive(Subcommand)]
+enum VocabularyAction {
+    /// Show the locally saved settings as JSON.
+    Show,
+    /// Replace terms or change context use. Omitted fields stay unchanged.
+    Set {
+        /// Comma/newline-separated terms; an empty string clears the list.
+        #[arg(long)]
+        terms: Option<String>,
+        /// Use the meeting's notes and manually entered title as speech hints.
+        #[arg(long)]
+        use_context: Option<bool>,
     },
 }
 pub fn run() -> Result<()> {
@@ -167,6 +186,12 @@ pub fn run() -> Result<()> {
                 )?;
             }
             ModelAction::Manifest { model: choice } => println!("{}", model::dependencies(choice)?),
+        },
+        Command::Vocabulary { action } => match action {
+            VocabularyAction::Show => print_json(&vocabulary::load(&p)?)?,
+            VocabularyAction::Set { terms, use_context } => {
+                print_json(&vocabulary::update(&p, terms.as_deref(), use_context)?)?;
+            }
         },
         Command::Mcp => mcp::run(&p)?,
         Command::Doctor => {
