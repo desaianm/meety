@@ -29,12 +29,26 @@ pub struct SpeakerStream {
     _ctx: Box<Ctx>,
     _tap: ca::TapGuard,
     waker_state: Arc<Mutex<WakerState>>,
-    current_sample_rate: Arc<AtomicU32>,
+    sample_rate: f64,
+    expected_format: cat::AudioStreamBasicDesc,
 }
 
 impl SpeakerStream {
-    pub fn sample_rate(&self) -> u32 {
-        self.current_sample_rate.load(Ordering::Acquire)
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+    /// Check outside the realtime callback. A real route/format change ends
+    /// this stream epoch; queued samples are never relabelled with a new rate.
+    pub fn check_format(&self) -> Result<()> {
+        let actual = self
+            ._tap
+            .asbd()
+            .context("System audio tap format is unavailable")?;
+        check_stream_format(
+            &self.expected_format,
+            &actual,
+            self._device.as_ref().nominal_sample_rate().ok(),
+        )
     }
 }
 
@@ -42,7 +56,6 @@ struct Ctx {
     format: arc::R<av::AudioFormat>,
     producer: HeapProd<f32>,
     waker_state: Arc<Mutex<WakerState>>,
-    current_sample_rate: Arc<AtomicU32>,
     consecutive_drops: Arc<AtomicU32>,
     should_terminate: Arc<AtomicBool>,
 }
@@ -96,7 +109,7 @@ impl SpeakerInput {
         ctx: &mut Box<Ctx>,
     ) -> Result<ca::hardware::StartedDevice<ca::AggregateDevice>> {
         extern "C" fn proc(
-            device: ca::Device,
+            _device: ca::Device,
             _now: &cat::AudioTimeStamp,
             input_data: &cat::AudioBufList<1>,
             _input_time: &cat::AudioTimeStamp,
@@ -106,16 +119,10 @@ impl SpeakerInput {
         ) -> os::Status {
             let ctx = ctx.unwrap();
 
-            let after = device
-                .nominal_sample_rate()
-                .unwrap_or(ctx.format.absd().sample_rate) as u32;
-            let before = ctx.current_sample_rate.load(Ordering::Acquire);
-
-            if before != after {
-                ctx.current_sample_rate.store(after, Ordering::Release);
-                tracing::info!(before = before, after = after, "sample_rate",);
-            }
-
+            // Buffers are decoded using ctx.format, obtained from the process
+            // tap's ASBD. The aggregate device's *nominal* clock is not their
+            // format: it can report zero during device transitions. Never use
+            // that live property to relabel already-queued samples.
             if let Some(view) =
                 av::AudioPcmBuf::with_buf_list_no_copy(&ctx.format, input_data, None)
             {
@@ -160,14 +167,12 @@ impl SpeakerInput {
             has_data: false,
         }));
 
-        let current_sample_rate = Arc::new(AtomicU32::new(asbd.sample_rate as u32));
-        tracing::info!(init = asbd.sample_rate, "sample_rate");
+        let sample_rate = tap_sample_rate(asbd.sample_rate)?;
 
         let mut ctx = Box::new(Ctx {
             format,
             producer,
             waker_state: waker_state.clone(),
-            current_sample_rate: current_sample_rate.clone(),
             consecutive_drops: Arc::new(AtomicU32::new(0)),
             should_terminate: Arc::new(AtomicBool::new(false)),
         });
@@ -180,7 +185,8 @@ impl SpeakerInput {
             _ctx: ctx,
             _tap: self.tap,
             waker_state,
-            current_sample_rate,
+            sample_rate,
+            expected_format: asbd,
         })
     }
 }
@@ -254,5 +260,59 @@ impl Stream for SpeakerStream {
 impl Drop for SpeakerStream {
     fn drop(&mut self) {
         self._ctx.should_terminate.store(true, Ordering::Release);
+    }
+}
+
+// The rate belongs to the tap buffer format, not to mutable output-device
+// metadata. Keep it immutable for this stream, including fractional rates.
+fn tap_sample_rate(format_rate: f64) -> Result<f64> {
+    anyhow::ensure!(
+        format_rate.is_finite() && (8_000.0..=192_000.0).contains(&format_rate),
+        "Unsupported system audio tap sample rate: {format_rate}"
+    );
+    Ok(format_rate)
+}
+
+fn check_stream_format(
+    expected: &cat::AudioStreamBasicDesc,
+    actual: &cat::AudioStreamBasicDesc,
+    nominal: Option<f64>,
+) -> Result<()> {
+    anyhow::ensure!(expected == actual,
+        "System audio format changed. Recording stopped to preserve audio timing; start a new recording for the new device.");
+    // A transient zero/NaN/error is not a new format. A positive, finite
+    // mismatch is unsafe too (some Bluetooth routes retain a stale tap ASBD).
+    if let Some(rate) = nominal.filter(|r| r.is_finite() && *r > 0.0) {
+        anyhow::ensure!((rate - expected.sample_rate).abs() <= 1.0,
+            "System audio device rate changed. Recording stopped to preserve audio timing; start a new recording for the new device.");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn tap_buffers_keep_their_format_when_device_nominal_rate_disappears() {
+        // Nominal-device metadata no longer enters this API or the callback.
+        // Both the format decoder and queue consumer share the original ASBD.
+        assert_eq!(tap_sample_rate(48_000.0).unwrap(), 48_000.0);
+        assert_eq!(tap_sample_rate(44_100.5).unwrap(), 44_100.5);
+        for invalid in [0.0, f64::NAN, f64::INFINITY, 7_999.0, 192_001.0] {
+            assert!(tap_sample_rate(invalid).is_err());
+        }
+        let expected = cat::AudioStreamBasicDesc {
+            sample_rate: 48_000.0,
+            ..Default::default()
+        };
+        for nominal in [Some(0.0), Some(f64::NAN), Some(48_000.0), None] {
+            assert!(check_stream_format(&expected, &expected, nominal).is_ok());
+        }
+        assert!(check_stream_format(&expected, &expected, Some(24_000.0)).is_err());
+        let changed = cat::AudioStreamBasicDesc {
+            sample_rate: 24_000.0,
+            ..expected
+        };
+        assert!(check_stream_format(&expected, &changed, Some(24_000.0)).is_err());
     }
 }

@@ -209,6 +209,7 @@ impl Paths {
         Ok(changed != 0)
     }
     pub fn save_transcript(&self, id: &str, segments: &[Segment], duration: f64) -> Result<()> {
+        let warning = self.capture_warning(id)?;
         let mut conn = self.db()?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM segments WHERE meeting_id=?1", [id])?;
@@ -221,12 +222,36 @@ impl Paths {
             )?;
         }
         tx.execute(
-            "UPDATE meetings SET status='complete',error=NULL,duration_seconds=?2 WHERE id=?1",
-            params![id, duration],
+            "UPDATE meetings SET status='complete',error=?3,duration_seconds=?2 WHERE id=?1",
+            params![id, duration, warning],
         )?;
         tx.commit()?;
         self.write_markdown(id)?;
         Ok(())
+    }
+    pub fn record_capture_warning(&self, id: &str, warning: &str) -> Result<()> {
+        let id = self.resolve(id)?;
+        if warning.len() > 16_384 {
+            bail!("Capture warning is too long");
+        }
+        atomic_write(
+            &self.meeting_dir(&id).join("capture-warning.txt"),
+            warning.as_bytes(),
+        )
+    }
+    pub fn capture_warning(&self, id: &str) -> Result<Option<String>> {
+        use std::io::Read;
+        let file = match fs::File::open(self.meeting_dir(id).join("capture-warning.txt")) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut text = String::new();
+        file.take(16_385).read_to_string(&mut text)?;
+        if text.len() > 16_384 {
+            bail!("Capture warning is too long");
+        }
+        Ok(Some(text))
     }
     fn write_markdown(&self, id: &str) -> Result<()> {
         use fs2::FileExt;
@@ -344,6 +369,9 @@ impl Transcript {
             "# {}\n\nDate: {}\nStatus: {}\n\n",
             self.meeting.title, self.meeting.created_at, self.meeting.status
         );
+        if let Some(warning) = &self.meeting.error {
+            text.push_str(&format!("## Recording warning\n\n{}\n\n", warning));
+        }
         if !self.notes.trim().is_empty() {
             text.push_str(&format!("## Notes\n\n{}\n\n", self.notes.trim()));
         }
@@ -378,6 +406,38 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn partial_capture_warning_survives_transcription_and_export() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let p = Paths::new(Some(temp.path().into()))?;
+        let id = p.create("Partial fixture", "failed")?;
+        let audio = p.meeting_dir(&id).join("microphone.wav");
+        fs::write(&audio, b"retained fixture bytes")?;
+        let warning = "Partial recording: capture ended unexpectedly; later speech may be missing.";
+        p.record_capture_warning(&id, warning)?;
+        p.set_status(&id, "transcribing", None)?;
+        p.save_transcript(
+            &id,
+            &[Segment {
+                start_ms: 0,
+                end_ms: 1000,
+                source: "You".into(),
+                text: "Retained speech".into(),
+            }],
+            1.0,
+        )?;
+        let t = p.get(&id)?;
+        assert_eq!(t.meeting.status, "complete");
+        assert_eq!(t.meeting.error.as_deref(), Some(warning));
+        assert!(t.markdown().contains(warning));
+        assert!(fs::read_to_string(p.meeting_dir(&id).join("transcript.md"))?.contains(warning));
+        assert_eq!(fs::read(audio)?, b"retained fixture bytes");
+        // Repeating transcription must not silently turn partial audio into a
+        // supposedly complete recording.
+        p.save_transcript(&id, &t.segments, 1.0)?;
+        assert_eq!(p.get(&id)?.meeting.error.as_deref(), Some(warning));
+        Ok(())
+    }
     #[test]
     fn legacy_title_migration_protects_all_existing_titles() -> Result<()> {
         let temp = tempfile::tempdir()?;

@@ -525,22 +525,8 @@ fn worker(
                         }
                         "stop" => {
                             let (id, audio) = capture.take().context("No active recording")?;
-                            state.lock().unwrap().active = None;
-                            if let Err(e) = audio.stop() {
-                                p.set_status(&id, "failed", Some(&format!("{e:#}")))?;
-                                return Err(e);
-                            }
-                            p.set_status(&id, "ready", None)?;
-                            state.lock().unwrap().transcribing = true;
-                            let paths = p.clone();
-                            let status = state.clone();
-                            let job_id = id.clone();
-                            std::thread::spawn(move || {
-                                let result = transcribe::run(&paths, &job_id);
-                                let mut s = status.lock().unwrap();
-                                s.transcribing = false;
-                                s.error = result.err().map(|e| format!("{e:#}"));
-                            });
+                            let warning = audio.stop().err().map(|e| format!("{e:#}"));
+                            finish_recording(&p, &state, &id, warning)?;
                             Ok(json!({"id":id,"recording":false,"transcribing":true}))
                         }
                         _ => bail!("Unknown app command"),
@@ -554,17 +540,59 @@ fn worker(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
-        if let Some((id, audio)) = &capture {
+        let capture_error = if let Some((_, audio)) = &capture {
             let mut s = state.lock().unwrap();
             s.elapsed = audio.started.elapsed().as_secs();
             s.metrics = audio.metrics();
-            if let Some(error) = audio.error() {
-                s.error = Some(error.clone());
-                let _ = p.set_status(id, "failed", Some(&error));
+            audio.error()
+        } else {
+            None
+        };
+        if let Some(error) = capture_error {
+            // A dead capture must not keep showing an active recording. Close
+            // the WAVs and transcribe whatever survived, with a durable warning.
+            let (id, audio) = capture.take().unwrap();
+            let _ = audio.stop();
+            if let Err(e) = finish_recording(&p, &state, &id, Some(error)) {
+                let mut s = state.lock().unwrap();
+                s.active = None;
+                s.error = Some(format!("{e:#}"));
             }
         }
     }
 }
+fn finish_recording(
+    p: &Paths,
+    state: &Arc<Mutex<State>>,
+    id: &str,
+    capture_error: Option<String>,
+) -> Result<()> {
+    // Capture ownership has already been consumed. Persistence can fail (for
+    // example on a full disk), but the app must never claim it is still live.
+    state.lock().unwrap().active = None;
+    let warning = capture_error.map(|error| format!("Partial recording: audio capture stopped unexpectedly ({error}). This transcript covers only retained audio; later speech may be missing."));
+    if let Some(warning) = &warning {
+        p.record_capture_warning(id, warning)?;
+    }
+    p.set_status(id, "ready", warning.as_deref())?;
+    {
+        let mut s = state.lock().unwrap();
+        s.active = None;
+        s.transcribing = true;
+        s.error = warning.clone();
+    }
+    let paths = p.clone();
+    let state = state.clone();
+    let id = id.to_owned();
+    std::thread::spawn(move || {
+        let result = transcribe::run(&paths, &id);
+        let mut s = state.lock().unwrap();
+        s.transcribing = false;
+        s.error = result.err().map(|e| format!("{e:#}")).or(warning);
+    });
+    Ok(())
+}
+
 fn icon(recording: bool) -> Icon {
     let mut rgba = vec![0; 24 * 24 * 4];
     for y in 0..24 {
@@ -587,4 +615,26 @@ fn icon(recording: bool) -> Icon {
         }
     }
     Icon::from_rgba(rgba, 24, 24).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_warning_persistence_cannot_leave_a_phantom_recording() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let p = Paths::new(Some(dir.path().into()))?;
+        let id = p.create("Capture failure fixture", "recording")?;
+        fs::create_dir(p.meeting_dir(&id).join("capture-warning.txt"))?;
+        let state = Arc::new(Mutex::new(State {
+            active: Some(id.clone()),
+            ..State::default()
+        }));
+        assert!(
+            finish_recording(&p, &state, &id, Some("Simulated capture failure".into())).is_err()
+        );
+        assert!(state.lock().unwrap().active.is_none());
+        assert!(!state.lock().unwrap().transcribing);
+        Ok(())
+    }
 }
