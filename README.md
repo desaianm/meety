@@ -58,7 +58,7 @@ macOS asks for microphone and system-audio access on first use. Changing signing
 3. Click **Start recording** and grant the requested macOS audio permissions.
 4. Click **Stop & transcribe**. The transcript appears beside your notes when local processing finishes.
 
-If capture fails or the output-device format changes, the app stops the recording indicator, closes the audio files and transcribes the retained audio automatically. A **Partial recording** warning remains in the meeting and Markdown export, including after retries. A real device-format change requires starting a new recording; brief invalid device-rate metadata does not change the audio's sample rate.
+If capture fails or its actual input-stream format changes, the app stops the recording indicator, closes the audio files and transcribes the retained audio automatically. A **Partial recording** warning remains in the meeting and Markdown export, including after retries. A real capture-format change requires starting a new recording. The system-audio tap uses its own private aggregate and the actual input-buffer format, so a separate output-device clock rate does not block startup or change the saved audio's timing.
 
 Closing the window leaves the menu bar app running. Choose **Open Meetlocal** from its menu to reopen the library. Use **Open Markdown** to view an exported copy. **Delete meeting** permanently removes its notes, transcript, search entries and saved audio after confirmation; copies exported elsewhere remain.
 

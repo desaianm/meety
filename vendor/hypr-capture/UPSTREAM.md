@@ -8,10 +8,14 @@ The extracted crate preserves its microphone/CPAL and system-audio/Core Audio pr
 
 Meety also adds a passive Core Audio process-input activity query for possible-call hints. This reads per-process metadata, excludes the caller, and opens no audio device or process tap.
 
-System-audio sample rates now come from the tap buffer ASBD as an immutable
-`f64`, rather than a mutable aggregate-device nominal-rate property. Invalid
-nominal metadata cannot relabel queued samples. A non-realtime check before
-capture and every 500 ms rejects actual tap-format or positive nominal-rate
-changes, so the app can finalize and transcribe partial audio with a warning
-instead of silently changing playback speed. New recording is required after
-a genuine route-format change; automatic route reconstruction is not included.
+System-audio capture uses a private tap-only aggregate with drift compensation,
+without a physical output subdevice or its clock/input channels. The tap-start
+wait flag is false, so starting capture does not wait for another app to play audio. The private
+aggregate is configured to the tap's initial rate; no physical device setting is
+changed. A bounded two-second poll waits for the private input format to settle
+before IO starts. Decode and resample using the actual aggregate input stream's virtual
+ASBD, with an immutable `f64` rate per stream epoch. A non-realtime check before
+capture and every 500 ms compares that same virtual format to its baseline,
+ignoring reserved padding. Unrelated nominal-device rates are not compared.
+Genuine input-format changes still end the epoch with a partial-recording warning;
+seamless reconstruction across such changes is not implemented.
